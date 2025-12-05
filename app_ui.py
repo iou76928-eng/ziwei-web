@@ -40,6 +40,27 @@ def scrape_and_format_raw_text(year, month, day, hour, gender_val):
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         
+        # === 新增：極限省記憶體設定 ===
+        options.add_argument("--window-size=1024,768") # 縮小視窗
+        options.add_argument("--disable-extensions")   # 禁用擴充功能
+        options.add_argument("--disable-infobars")
+        
+        # 【關鍵】設定 Chrome 不載入圖片 (Image Block)
+        prefs = {
+            "profile.managed_default_content_settings.images": 2, 
+            "profile.default_content_setting_values.notifications": 2
+        }
+        options.add_experimental_option("prefs", prefs)
+        # ==========================
+
+        # Chrome binary 位置 (維持原樣)
+        chrome_bin = os.environ.get("CHROME_BIN")
+        if chrome_bin:
+            options.binary_location = chrome_bin
+
+        driver = webdriver.Chrome(options=options)
+
+        
         driver = webdriver.Chrome(options=options)
         driver.get("https://fate.windada.com/cgi-bin/fate")
         
@@ -398,4 +419,5 @@ def open_browser():
 if __name__ == "__main__":
     print(f"=== 紫微斗數 Web UI 啟動 (連結核心版本: {getattr(engine, 'CYEAR', 'Unknown')}) ===")
     Timer(1, open_browser).start()
+
     app.run(host="0.0.0.0", port=5000, debug=False)
