@@ -1,0 +1,5 @@
+flask
+selenium
+beautifulsoup4
+gunicorn
+webdriver-manager
