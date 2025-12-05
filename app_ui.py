@@ -1,15 +1,12 @@
 # -*- coding: utf-8 -*-
 import sys
-import os
 import webbrowser
 from threading import Timer
 from flask import Flask, request, render_template_string
 from bs4 import BeautifulSoup
 import re
 import time
-
-# === 新增：Gemini AI 套件 ===
-import google.generativeai as genai
+import requests  # 替換 Selenium
 
 # === 匯入核心與邏輯轉接器 ===
 try:
@@ -19,120 +16,67 @@ except ImportError as e:
     print(f"【嚴重錯誤】找不到模組！{e}。請確保 ziwei_core.py 與 zh2_logic.py 在同一目錄下。")
     sys.exit(1)
 
-# === Selenium 相關套件 ===
-try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import Select
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.chrome.options import Options
-    # 【修正1】新增這兩行，用來自動管理 ChromeDriver
-    from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
-except ImportError:
-    print("【嚴重錯誤】缺少 Selenium 套件！請執行 pip install selenium webdriver-manager")
-    sys.exit(1)
-
 app = Flask(__name__)
 
-# ==========================================
-# 1. 設定 Gemini API 與 提示詞 (Prompt)
-# ==========================================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") 
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
-SYSTEM_PROMPT = """
-你是一位精通「紫微斗數」的資深命理大師，你的名字叫「Gemini 老師」。
-你的解讀風格是：溫暖人心、直指核心、白話易懂，並且會給出具體的人生建議。
-
-【任務目標】
-使用者會提供一份包含「九個區塊」的命盤分析數據（包含流年、流月、大限等資訊）。
-請你綜合這些破碎的資訊，為使用者撰寫一份約 600~800 字的【年度運勢總結報告】。
-
-【報告架構要求】
-1. **🌸 年度關鍵字**：請給這一年一個充滿意境的主題（例如：破繭而出、沉潛蓄勢）。
-2. **🎯 核心課題**：根據「流年課題」與「大限課題」，告訴使用者今年最需要關注的重心是什麼？
-3. **💰 財富與事業**：整合財帛宮與官祿宮的星象（特別注意化祿、化權、化忌），給出具體的操作建議。
-4. **⚠️ 風險提醒**：溫柔地提醒需要避開的月份或潛在的健康/人際問題。
-5. **💌 大師寄語**：最後給一句充滿力量的鼓勵話語。
-
-請使用 Markdown 格式輸出，重點部分請用粗體標示。
-"""
-
-# ================= 爬蟲層 (Data Layer) =================
+# ================= 爬蟲層 (Data Layer) - 改用 Requests 輕量化版 =================
 def scrape_and_format_raw_text(year, month, day, hour, gender_val):
-    driver = None
+    """
+    使用 Requests 取代 Selenium，大幅降低記憶體消耗。
+    """
     try:
-        print(f"【爬蟲啟動】目標：{year}/{month}/{day} {hour}時 (性別:{gender_val})")
-        options = Options()
-        options.add_argument("--headless")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
+        print(f"【爬蟲啟動 (Light)】目標：{year}/{month}/{day} {hour}時 (性別:{gender_val})")
         
-        # === 極限省記憶體設定 ===
-        options.add_argument("--window-size=1024,768")
-        options.add_argument("--disable-extensions")
-        options.add_argument("--disable-infobars")
+        # 目標網址
+        url = "https://fate.windada.com/cgi-bin/fate"
         
-        # 設定 Chrome 不載入圖片
-        prefs = {
-            "profile.managed_default_content_settings.images": 2, 
-            "profile.default_content_setting_values.notifications": 2
+        # 參數處理：Windada (與多數傳統CGI) 通常定義 1=男, 2=女
+        # 你的 UI 傳入 1(男) 或 0(女)，這邊做個轉換以防萬一
+        sex_payload = "1" if str(gender_val) == "1" else "2"
+        
+        # 建構 POST 資料 (模擬表單提交)
+        # 根據經驗與網頁結構，input name 通常為 year, month, day, hour, sex
+        payload = {
+            "year": year,
+            "month": month,
+            "day": day,
+            "hour": hour,
+            "sex": sex_payload,
+            "method": "0"  # 有些 CGI 需要預設方法參數，通常 0 是排盤
         }
-        options.add_experimental_option("prefs", prefs)
-
-        # Chrome binary 位置 (Render 環境專用)
-        chrome_bin = os.environ.get("CHROME_BIN")
-        if chrome_bin:
-            options.binary_location = chrome_bin
-
-        # 【修正2】使用 webdriver_manager 自動安裝並取得驅動路徑
-        # 這樣就不用擔心 Render 找不到 chromedriver 在哪了
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
         
-        driver.get("https://fate.windada.com/cgi-bin/fate")
-        
-        WebDriverWait(driver, 15).until(lambda d: "紫微" in d.title)
-        
-        try:
-            el = driver.find_element(By.ID, "bYear")
-            el.clear()
-            el.send_keys(str(year))
-            Select(driver.find_element(By.ID, "bMonth")).select_by_value(str(month))
-            Select(driver.find_element(By.ID, "bDay")).select_by_value(str(day))
-            Select(driver.find_element(By.ID, "bHour")).select_by_value(str(hour))
-            target_id = "bMale" if str(gender_val) == "1" else "bFemale"
-            driver.execute_script("arguments[0].click();", driver.find_element(By.ID, target_id))
-        except Exception as e:
-            return f"填表過程錯誤: {e}"
+        # 偽裝成瀏覽器 User-Agent
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Referer": "https://fate.windada.com/"
+        }
 
-        try:
-            driver.find_element(By.CSS_SELECTOR, "input[type='submit']").click()
-        except:
-            driver.execute_script("document.forms[0].submit();")
-
-        try:
-            WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((By.XPATH, "//table[contains(@style, 'border:2px solid black')]"))
-            )
-        except:
-            print("等待逾時，嘗試直接抓取...")
+        # 發送請求
+        response = requests.post(url, data=payload, headers=headers, timeout=10)
         
-        page_html = driver.page_source
+        # 編碼處理：台灣舊網站通常是 Big5 或 CP950
+        response.encoding = "cp950" 
+        
+        if response.status_code != 200:
+            return f"遠端伺服器回應錯誤: {response.status_code}"
+
+        page_html = response.text
+        
+        # 檢查是否成功抓到內容
+        if "紫微" not in page_html and "命宮" not in page_html:
+             # 如果 POST 失敗，嘗試 GET (有些舊站容錯)
+            print("POST 失敗，嘗試 GET...")
+            response = requests.get(url, params=payload, headers=headers, timeout=10)
+            response.encoding = "cp950"
+            page_html = response.text
 
     except Exception as e:
-        return f"瀏覽器執行錯誤: {str(e)}"
-    finally:
-        if driver: driver.quit() 
+        return f"連線錯誤 (Requests): {str(e)}"
 
+    # === 以下解析邏輯 (BeautifulSoup) 保持不變 ===
     soup = BeautifulSoup(page_html, 'html.parser')
     
     header_lines = []
+    # 嘗試抓取中間的命主資訊
     center_cell = soup.find("td", {"colspan": "2"})
     if center_cell:
         full_text = center_cell.get_text(separator="\n")
@@ -195,7 +139,7 @@ def scrape_and_format_raw_text(year, month, day, hour, gender_val):
         cells.append(formatted_cell)
 
     if len(cells) < 12:
-        return f"錯誤：無法解析宮位 (只抓到 {len(cells)} 個)，可能網頁改版。\n解析Log: {cells}"
+        return f"錯誤：無法解析宮位 (只抓到 {len(cells)} 個)，可能網站參數改變或編碼錯誤。\n解析Log: {cells}"
 
     final_raw_text = "\n".join(header_lines) + "\n\n" + "\n\n".join(cells)
     return final_raw_text
@@ -208,7 +152,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>紫微斗數智慧分析 (AI 大師版)</title>
+    <title>紫微斗數智慧分析 (極速版)</title>
     <style>
         body { font-family: "Microsoft JhengHei", sans-serif; background: #121212; color: #e0e0e0; margin: 0; padding: 20px; }
         .container { max-width: 1400px; margin: 0 auto; background: #1e1e1e; padding: 25px; border-radius: 12px; border: 1px solid #333; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
@@ -229,34 +173,51 @@ HTML_TEMPLATE = """
         .loading-text { color: #bb86fc; font-size: 2rem; font-weight: bold; }
         .error-msg { background: #cf6679; color: #000; padding: 15px; border-radius: 6px; margin-top: 20px; font-weight: bold; }
 
-        /* AI Result Box */
-        .ai-result-box {
-            background: #2d2d30;
-            border: 2px solid #bb86fc;
-            border-radius: 8px;
-            margin-top: 30px;
-            padding: 20px;
-            box-shadow: 0 0 15px rgba(187, 134, 252, 0.2);
-        }
-        .ai-title { color: #bb86fc; font-size: 1.5rem; font-weight: bold; margin-bottom: 15px; border-bottom: 1px solid #555; padding-bottom: 10px; }
-        .ai-content { font-size: 1.1rem; line-height: 1.8; color: #fff; white-space: pre-wrap; }
-
-        /* 九區塊佈局 */
         .grid-container {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
             gap: 15px;
             margin-top: 30px;
         }
-        @media (max-width: 900px) { .grid-container { grid-template-columns: repeat(2, 1fr); } }
-        @media (max-width: 600px) { .grid-container { grid-template-columns: 1fr; } }
+        @media (max-width: 900px) {
+            .grid-container { grid-template-columns: repeat(2, 1fr); }
+        }
+        @media (max-width: 600px) {
+            .grid-container { grid-template-columns: 1fr; }
+        }
 
-        .block-card { background: #252526; border: 1px solid #444; border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
-        .block-9 { grid-column: span 1; }
-        @media (min-width: 900px) { .block-9 { grid-column: span 1; } }
+        .block-card {
+            background: #252526;
+            border: 1px solid #444;
+            border-radius: 8px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        .block-9 {
+            grid-column: span 1;
+        }
+        @media (min-width: 900px) {
+            .block-9 { grid-column: span 1; }
+        }
 
-        .block-header { background: #003366; color: #fff; padding: 10px 15px; font-weight: bold; font-size: 1.1rem; border-bottom: 1px solid #444; }
-        .block-content { padding: 15px; font-family: "Microsoft JhengHei", sans-serif; font-size: 0.95rem; line-height: 1.6; color: #ddd; overflow-y: auto; max-height: 400px; }
+        .block-header {
+            background: #003366;
+            color: #fff;
+            padding: 10px 15px;
+            font-weight: bold;
+            font-size: 1.1rem;
+            border-bottom: 1px solid #444;
+        }
+        .block-content {
+            padding: 15px;
+            font-family: "Microsoft JhengHei", sans-serif;
+            font-size: 0.95rem;
+            line-height: 1.6;
+            color: #ddd;
+            overflow-y: auto;
+            max-height: 400px;
+        }
 
         .lu { color: #27ae60; font-weight: bold; }
         .quan { color: #9b59b6; font-weight: bold; }
@@ -267,26 +228,34 @@ HTML_TEMPLATE = """
         .luck-good { color: #d35400; font-weight: bold; }
         .luck-bad { color: #7f8c8d; font-weight: bold; }
         
-        .raw-data-area { margin-top: 30px; border-top: 1px solid #444; padding-top: 20px; }
-        .raw-data-area textarea { width: 100%; height: 150px; background: #111; color: #0f0; border: 1px solid #444; font-family: monospace; }
+        .raw-data-area {
+            margin-top: 30px;
+            border-top: 1px solid #444;
+            padding-top: 20px;
+        }
+        .raw-data-area textarea {
+            width: 100%; height: 150px;
+            background: #111; color: #0f0; border: 1px solid #444;
+            font-family: monospace;
+        }
     </style>
     <script>
         function showLoading() {
             document.getElementById('loading').style.display = 'block';
             document.getElementById('submitBtn').disabled = true;
-            document.getElementById('submitBtn').innerText = '正在召喚 AI 大師解盤...';
+            document.getElementById('submitBtn').innerText = '分析運算中...';
         }
     </script>
 </head>
 <body>
     <div id="loading" class="loading-overlay">
-        <div class="loading-text">🔮 命盤解析中...</div>
-        <p style="color:#fff;">爬蟲取盤 -> 核心運算 -> Gemini AI 解讀</p>
+        <div class="loading-text">🚀 極速分析中...</div>
+        <p style="color:#fff;">連結命盤資料庫 -> 核心運算 -> 九宮格重組</p>
     </div>
 
     <div class="container">
         <h1>🌌 紫微斗數智慧分析 (Web整合版)</h1>
-        <div class="subtitle">爬蟲 + 核心運算 + AI 大師解讀</div>
+        <div class="subtitle">Requests 極速爬蟲 + 核心運算 + 自動九區塊分類</div>
         
         <form method="post" onsubmit="showLoading()">
             <div class="control-panel">
@@ -339,13 +308,6 @@ HTML_TEMPLATE = """
             <div class="error-msg">⚠️ 執行錯誤：<br>{{ error }}</div>
         {% endif %}
 
-        {% if ai_analysis %}
-        <div class="ai-result-box">
-            <div class="ai-title">🤖 Gemini 大師解讀</div>
-            <div class="ai-content">{{ ai_analysis | safe }}</div>
-        </div>
-        {% endif %}
-
         {% if blocks %}
         <div class="grid-container">
             {% for bid in range(1, 10) %}
@@ -370,15 +332,20 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# ================= 路由控制 (Controller) =================
+
 @app.route("/", methods=["GET", "POST"])
 def index():
-    default_target_year = engine.current_year() + 1
+    try:
+        default_target_year = engine.current_year() + 1
+    except:
+        default_target_year = 2025 # Fallback
     
     context = {
         "year": "1992", "month": "9", "day": "25", "hour": "7", 
         "sex": "0", 
         "target_year": default_target_year, 
-        "blocks": None, "error": "", "raw_data": "", "ai_analysis": ""
+        "blocks": None, "error": "", "raw_data": ""
     }
 
     if request.method == "POST":
@@ -397,7 +364,7 @@ def index():
             
             target_year = int(target_year_str) if target_year_str else default_target_year
 
-            # 1. 執行爬蟲
+            # 1. 執行爬蟲 (使用 Requests)
             raw_data = scrape_and_format_raw_text(year, month, day, hour, sex)
             
             if "錯誤" in raw_data and "【" not in raw_data:
@@ -411,23 +378,6 @@ def index():
                     # 3. 呼叫 zh2_logic 進行九區塊重組
                     blocks_data = logic_adapter.process_ziwei_data(final_res_text)
                     context["blocks"] = blocks_data
-
-                    # 4. Gemini AI 解讀 (當 API Key 存在時)
-                    if GEMINI_API_KEY:
-                        try:
-                            # 組合 Prompt 內容
-                            full_content = "【使用者命盤數據】\n"
-                            for bid in range(1, 10):
-                                clean = re.sub(r'<[^>]+>', '', blocks_data[bid]['content'])
-                                full_content += f"### {blocks_data[bid]['title']}\n{clean}\n\n"
-
-                            model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_PROMPT)
-                            response = model.generate_content(full_content)
-                            context["ai_analysis"] = response.text
-                            
-                        except Exception as ai_e:
-                            print(f"AI Error: {ai_e}")
-                            context["ai_analysis"] = f"AI 大師休息中 (錯誤: {ai_e})"
                     
                 except Exception as logic_error:
                     import traceback
@@ -443,6 +393,7 @@ def open_browser():
     webbrowser.open_new("http://127.0.0.1:5000")
 
 if __name__ == "__main__":
-    print(f"=== 紫微斗數 Web UI 啟動 (連結核心版本: {getattr(engine, 'CYEAR', 'Unknown')}) ===")
-    Timer(1, open_browser).start()
+    print("=== 紫微斗數 Web UI (Render Optimized) 啟動 ===")
+    # 在 Render 上不需要自動開啟瀏覽器，可以註解掉，或保留給本地測試用
+    # Timer(1, open_browser).start()
     app.run(host="0.0.0.0", port=5000, debug=False)
