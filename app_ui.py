@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import sys
+import os  # <---【修正1】補上這裡，不然讀不到環境變數會報錯
 import webbrowser
 from threading import Timer
 from flask import Flask, request, render_template_string
@@ -10,7 +11,7 @@ import time
 # === 匯入核心與邏輯轉接器 ===
 try:
     import ziwei_core as engine
-    import zh2_logic as logic_adapter  # 新增這裡
+    import zh2_logic as logic_adapter
 except ImportError as e:
     print(f"【嚴重錯誤】找不到模組！{e}。請確保 ziwei_core.py 與 zh2_logic.py 在同一目錄下。")
     sys.exit(1)
@@ -29,7 +30,7 @@ except ImportError:
 
 app = Flask(__name__)
 
-# ================= 爬蟲層 (Data Layer) - 保持不變 =================
+# ================= 爬蟲層 (Data Layer) =================
 def scrape_and_format_raw_text(year, month, day, hour, gender_val):
     driver = None
     try:
@@ -40,28 +41,26 @@ def scrape_and_format_raw_text(year, month, day, hour, gender_val):
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         
-        # === 新增：極限省記憶體設定 ===
-        options.add_argument("--window-size=1024,768") # 縮小視窗
-        options.add_argument("--disable-extensions")   # 禁用擴充功能
+        # === 極限省記憶體設定 ===
+        options.add_argument("--window-size=1024,768")
+        options.add_argument("--disable-extensions")
         options.add_argument("--disable-infobars")
         
-        # 【關鍵】設定 Chrome 不載入圖片 (Image Block)
+        # 設定 Chrome 不載入圖片 (Image Block)
         prefs = {
             "profile.managed_default_content_settings.images": 2, 
             "profile.default_content_setting_values.notifications": 2
         }
         options.add_experimental_option("prefs", prefs)
-        # ==========================
 
-        # Chrome binary 位置 (維持原樣)
+        # Chrome binary 位置 (Render 環境專用)
         chrome_bin = os.environ.get("CHROME_BIN")
         if chrome_bin:
             options.binary_location = chrome_bin
 
+        # 【修正2】這裡原本有兩行 driver = ...，我刪掉了一行，只留一行
         driver = webdriver.Chrome(options=options)
-
         
-        driver = webdriver.Chrome(options=options)
         driver.get("https://fate.windada.com/cgi-bin/fate")
         
         WebDriverWait(driver, 15).until(lambda d: "紫微" in d.title)
