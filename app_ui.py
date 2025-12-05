@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 import sys
 import webbrowser
-from threading import Timer
+from threading import Timer, Lock
 from flask import Flask, request, render_template_string
 from bs4 import BeautifulSoup
 import re
 import time
-import requests  # 替換 Selenium
+import gc  # 新增：垃圾回收
 
 # === 匯入核心與邏輯轉接器 ===
 try:
@@ -16,59 +16,104 @@ except ImportError as e:
     print(f"【嚴重錯誤】找不到模組！{e}。請確保 ziwei_core.py 與 zh2_logic.py 在同一目錄下。")
     sys.exit(1)
 
+# === Selenium 相關套件 ===
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import Select
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service # 建議加上 Service
+except ImportError:
+    print("【嚴重錯誤】缺少 Selenium 套件！請執行 pip install selenium")
+    sys.exit(1)
+
 app = Flask(__name__)
 
-# ================= 爬蟲層 (Data Layer) - 改用 Requests 輕量化版 =================
+# 全域鎖：確保同一時間只有一個 Chrome 瀏覽器在執行，防止記憶體炸裂
+scrape_lock = Lock()
+
+# ================= 爬蟲層 (Data Layer) - 優化記憶體版 =================
 def scrape_and_format_raw_text(year, month, day, hour, gender_val):
-    """
-    修正版：使用 Requests + Regex 文字特徵識別，解決 HTML 標籤解析失敗的問題。
-    """
-    import requests
-    from bs4 import BeautifulSoup
-    import re
-    
+    # 嘗試獲取鎖，防止多人同時使用導致記憶體爆炸
+    if not scrape_lock.acquire(blocking=True, timeout=10):
+        return "系統忙碌中，請稍後再試。"
+
     driver = None
     try:
-        print(f"【爬蟲啟動 (Robust)】目標：{year}/{month}/{day} {hour}時 (性別:{gender_val})")
+        print(f"【爬蟲啟動】目標：{year}/{month}/{day} {hour}時 (性別:{gender_val})")
         
-        url = "https://fate.windada.com/cgi-bin/fate"
-        # 轉換性別參數：UI傳入 1(男)/0(女) -> 網站需要 1(男)/2(女)
-        sex_payload = "1" if str(gender_val) == "1" else "2"
+        options = Options()
+        # === 記憶體極限優化參數 (針對 Render) ===
+        options.add_argument("--headless=new") # 新版 headless 模式更穩定
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage") # 關鍵：解決 Docker 環境記憶體不足
+        options.add_argument("--disable-extensions")
+        options.add_argument("--blink-settings=imagesEnabled=false") # 不載入圖片
+        options.add_argument("--disk-cache-size=1") # 禁用快取
         
-        payload = {
-            "year": year,
-            "month": month,
-            "day": day,
-            "hour": hour,
-            "sex": sex_payload,
-            "method": "0" 
-        }
-        
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Referer": "https://fate.windada.com/"
-        }
+        # 啟動瀏覽器
+        driver = webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(30) # 設定逾時防止卡死
 
-        # 1. 發送請求
-        response = requests.post(url, data=payload, headers=headers, timeout=15)
+        driver.get("https://fate.windada.com/cgi-bin/fate")
         
-        # 2. 強制設定編碼 (關鍵修復：嘗試 cp950，若失敗則用自動偵測)
-        response.encoding = "cp950"
+        # 等待標題出現，確認載入成功
+        WebDriverWait(driver, 15).until(lambda d: "紫微" in d.title)
         
-        # 如果發現內容是亂碼 (不包含 '紫微' 或 '命盤')，嘗試切換編碼
-        if "紫微" not in response.text and "命" not in response.text:
-            response.encoding = response.apparent_encoding
+        # === 填寫表單 ===
+        try:
+            el = driver.find_element(By.ID, "bYear")
+            el.clear()
+            el.send_keys(str(year))
+            Select(driver.find_element(By.ID, "bMonth")).select_by_value(str(month))
+            Select(driver.find_element(By.ID, "bDay")).select_by_value(str(day))
+            Select(driver.find_element(By.ID, "bHour")).select_by_value(str(hour))
+            target_id = "bMale" if str(gender_val) == "1" else "bFemale"
+            # 使用 JS 點擊避免被遮擋
+            driver.execute_script("arguments[0].click();", driver.find_element(By.ID, target_id))
+        except Exception as e:
+            return f"填表過程錯誤: {e}"
 
-        page_html = response.text
+        # === 送出表單 ===
+        try:
+            driver.find_element(By.CSS_SELECTOR, "input[type='submit']").click()
+        except:
+            driver.execute_script("document.forms[0].submit();")
+
+        # === 等待結果 (優化等待邏輯) ===
+        try:
+            # 等待表格出現
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.TAG_NAME, "table"))
+            )
+        except:
+            print("等待逾時，嘗試直接抓取...")
+        
+        # 取得網頁原始碼
+        page_html = driver.page_source
 
     except Exception as e:
-        return f"連線錯誤: {str(e)}"
+        return f"瀏覽器執行錯誤: {str(e)}"
+    finally:
+        # 強制關閉與記憶體回收
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
+        driver = None
+        gc.collect()
+        scrape_lock.release()
 
-    # === 解析邏輯 (大幅放寬標準) ===
+    # ==========================================
+    # === 關鍵修正：改用 Regex 解析 (Robust Parser) ===
+    # ==========================================
     soup = BeautifulSoup(page_html, 'html.parser')
     
     header_lines = []
-    # 嘗試抓取中間資訊
     center_cell = soup.find("td", {"colspan": "2"})
     if center_cell:
         full_text = center_cell.get_text(separator="\n")
@@ -78,36 +123,32 @@ def scrape_and_format_raw_text(year, month, day, hour, gender_val):
                 header_lines.append(line)
     
     cells = []
-    # 定義宮位關鍵字
     palace_keywords = ["命宮", "兄弟", "夫妻", "子女", "財帛", "疾厄", 
                        "遷移", "交友", "事業", "田宅", "福德", "父母"]
-    
     all_tds = soup.find_all('td')
     
     for td in all_tds:
-        # 略過中間的大格子
         if td.get("colspan") == "2": continue
         
-        # 取得該格子的純文字
         full_text = td.get_text(separator=" ", strip=True)
         
-        # === 修正點：使用 Regex 直接抓取 【XX宮】，不依賴 <b> 標籤 ===
+        # === 修正點：直接抓取 【XX宮】，不依賴 <b> 標籤 ===
         palace_match = re.search(r'【(.*?)】', full_text)
         
         if not palace_match:
-            continue # 沒抓到括號，跳過
+            continue 
             
         palace_clean = palace_match.group(1).replace("[", "").replace("]", "")
         
-        # 再次確認括號內的文字是否為有效宮位
+        # 驗證是否為有效宮位
         is_valid_palace = False
         for pk in palace_keywords:
             if pk in palace_clean:
                 is_valid_palace = True
                 break
         if not is_valid_palace: continue
-
-        # === 以下資料清理邏輯保持不變 ===
+            
+        # === 以下邏輯保持不變 ===
         stem_match = re.search(r'([甲乙丙丁戊己庚辛壬癸][子丑寅卯辰巳午未申酉戌亥])', full_text)
         stem_str = stem_match.group(1) if stem_match else "??"
         
@@ -122,15 +163,13 @@ def scrape_and_format_raw_text(year, month, day, hour, gender_val):
         else:
             xiaoxian_str = "小限: (自動補全)"
 
-        # 移除已抓取的資訊，剩下的就是星曜
         star_text_raw = full_text
         star_text_raw = star_text_raw.replace(stem_str, "", 1)
-        # 移除 【XX宮】 整個字串
+        # 使用 Regex group 移除宮位名稱，更精準
         star_text_raw = star_text_raw.replace(palace_match.group(0), "") 
         
         if daxian_match: star_text_raw = star_text_raw.replace(daxian_match.group(0), "")
         if xiaoxian_match: star_text_raw = star_text_raw.replace(xiaoxian_match.group(0), "")
-        
         star_text_raw = re.sub(r'大限\s*[:：]?', '', star_text_raw)
         star_text_raw = re.sub(r'小限\s*[:：]?', '', star_text_raw)
         star_text_clean = re.sub(r'\s+', ',', star_text_raw.strip())
@@ -145,13 +184,11 @@ def scrape_and_format_raw_text(year, month, day, hour, gender_val):
         cells.append(formatted_cell)
 
     if len(cells) < 12:
-        # 如果還是失敗，把 HTML 存下來或印出片段方便除錯
-        preview = page_html[:500] if page_html else "Empty HTML"
-        return f"錯誤：無法解析宮位 (只抓到 {len(cells)} 個)。\nHTML預覽: {preview}..."
+        # 如果失敗，回傳 HTML 片段以便除錯
+        return f"錯誤：無法解析宮位 (只抓到 {len(cells)} 個)。\nHTML預覽: {page_html[:300]}..."
 
     final_raw_text = "\n".join(header_lines) + "\n\n" + "\n\n".join(cells)
     return final_raw_text
-
 # ================= 網頁介面 HTML (UI Layer) =================
 
 HTML_TEMPLATE = """
@@ -160,7 +197,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>紫微斗數智慧分析 (極速版)</title>
+    <title>紫微斗數智慧分析 (九區塊版)</title>
     <style>
         body { font-family: "Microsoft JhengHei", sans-serif; background: #121212; color: #e0e0e0; margin: 0; padding: 20px; }
         .container { max-width: 1400px; margin: 0 auto; background: #1e1e1e; padding: 25px; border-radius: 12px; border: 1px solid #333; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
@@ -202,12 +239,8 @@ HTML_TEMPLATE = """
             display: flex;
             flex-direction: column;
         }
-        .block-9 {
-            grid-column: span 1;
-        }
-        @media (min-width: 900px) {
-            .block-9 { grid-column: span 1; }
-        }
+        .block-9 { grid-column: span 1; }
+        @media (min-width: 900px) { .block-9 { grid-column: span 1; } }
 
         .block-header {
             background: #003366;
@@ -257,13 +290,13 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div id="loading" class="loading-overlay">
-        <div class="loading-text">🚀 極速分析中...</div>
-        <p style="color:#fff;">連結命盤資料庫 -> 核心運算 -> 九宮格重組</p>
+        <div class="loading-text">🔮 命盤解析中...</div>
+        <p style="color:#fff;">爬蟲取盤 -> 核心運算 -> 九宮格重組</p>
     </div>
 
     <div class="container">
         <h1>🌌 紫微斗數智慧分析 (Web整合版)</h1>
-        <div class="subtitle">Requests 極速爬蟲 + 核心運算 + 自動九區塊分類</div>
+        <div class="subtitle">爬蟲 + 核心運算 + 自動九區塊分類</div>
         
         <form method="post" onsubmit="showLoading()">
             <div class="control-panel">
@@ -372,7 +405,7 @@ def index():
             
             target_year = int(target_year_str) if target_year_str else default_target_year
 
-            # 1. 執行爬蟲 (使用 Requests)
+            # 1. 執行爬蟲
             raw_data = scrape_and_format_raw_text(year, month, day, hour, sex)
             
             if "錯誤" in raw_data and "【" not in raw_data:
@@ -401,8 +434,7 @@ def open_browser():
     webbrowser.open_new("http://127.0.0.1:5000")
 
 if __name__ == "__main__":
-    print("=== 紫微斗數 Web UI (Render Optimized) 啟動 ===")
+    print(f"=== 紫微斗數 Web UI (Render Optimized) 啟動 ===")
     # 在 Render 上不需要自動開啟瀏覽器，可以註解掉，或保留給本地測試用
     # Timer(1, open_browser).start()
     app.run(host="0.0.0.0", port=5000, debug=False)
-
