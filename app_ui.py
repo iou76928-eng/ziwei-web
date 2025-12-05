@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 import sys
-import os  # <---【修正1】補上這裡，不然讀不到環境變數會報錯
+import os
 import webbrowser
 from threading import Timer
 from flask import Flask, request, render_template_string
 from bs4 import BeautifulSoup
 import re
 import time
+
+# === 新增：Gemini AI 套件 ===
+import google.generativeai as genai
 
 # === 匯入核心與邏輯轉接器 ===
 try:
@@ -24,11 +27,40 @@ try:
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.chrome.options import Options
+    # 【修正1】新增這兩行，用來自動管理 ChromeDriver
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
 except ImportError:
-    print("【嚴重錯誤】缺少 Selenium 套件！請執行 pip install selenium")
+    print("【嚴重錯誤】缺少 Selenium 套件！請執行 pip install selenium webdriver-manager")
     sys.exit(1)
 
 app = Flask(__name__)
+
+# ==========================================
+# 1. 設定 Gemini API 與 提示詞 (Prompt)
+# ==========================================
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") 
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+SYSTEM_PROMPT = """
+你是一位精通「紫微斗數」的資深命理大師，你的名字叫「Gemini 老師」。
+你的解讀風格是：溫暖人心、直指核心、白話易懂，並且會給出具體的人生建議。
+
+【任務目標】
+使用者會提供一份包含「九個區塊」的命盤分析數據（包含流年、流月、大限等資訊）。
+請你綜合這些破碎的資訊，為使用者撰寫一份約 600~800 字的【年度運勢總結報告】。
+
+【報告架構要求】
+1. **🌸 年度關鍵字**：請給這一年一個充滿意境的主題（例如：破繭而出、沉潛蓄勢）。
+2. **🎯 核心課題**：根據「流年課題」與「大限課題」，告訴使用者今年最需要關注的重心是什麼？
+3. **💰 財富與事業**：整合財帛宮與官祿宮的星象（特別注意化祿、化權、化忌），給出具體的操作建議。
+4. **⚠️ 風險提醒**：溫柔地提醒需要避開的月份或潛在的健康/人際問題。
+5. **💌 大師寄語**：最後給一句充滿力量的鼓勵話語。
+
+請使用 Markdown 格式輸出，重點部分請用粗體標示。
+"""
 
 # ================= 爬蟲層 (Data Layer) =================
 def scrape_and_format_raw_text(year, month, day, hour, gender_val):
@@ -46,7 +78,7 @@ def scrape_and_format_raw_text(year, month, day, hour, gender_val):
         options.add_argument("--disable-extensions")
         options.add_argument("--disable-infobars")
         
-        # 設定 Chrome 不載入圖片 (Image Block)
+        # 設定 Chrome 不載入圖片
         prefs = {
             "profile.managed_default_content_settings.images": 2, 
             "profile.default_content_setting_values.notifications": 2
@@ -58,8 +90,10 @@ def scrape_and_format_raw_text(year, month, day, hour, gender_val):
         if chrome_bin:
             options.binary_location = chrome_bin
 
-        # 【修正2】這裡原本有兩行 driver = ...，我刪掉了一行，只留一行
-        driver = webdriver.Chrome(options=options)
+        # 【修正2】使用 webdriver_manager 自動安裝並取得驅動路徑
+        # 這樣就不用擔心 Render 找不到 chromedriver 在哪了
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
         
         driver.get("https://fate.windada.com/cgi-bin/fate")
         
@@ -174,7 +208,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>紫微斗數智慧分析 (九區塊版)</title>
+    <title>紫微斗數智慧分析 (AI 大師版)</title>
     <style>
         body { font-family: "Microsoft JhengHei", sans-serif; background: #121212; color: #e0e0e0; margin: 0; padding: 20px; }
         .container { max-width: 1400px; margin: 0 auto; background: #1e1e1e; padding: 25px; border-radius: 12px; border: 1px solid #333; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
@@ -195,55 +229,35 @@ HTML_TEMPLATE = """
         .loading-text { color: #bb86fc; font-size: 2rem; font-weight: bold; }
         .error-msg { background: #cf6679; color: #000; padding: 15px; border-radius: 6px; margin-top: 20px; font-weight: bold; }
 
+        /* AI Result Box */
+        .ai-result-box {
+            background: #2d2d30;
+            border: 2px solid #bb86fc;
+            border-radius: 8px;
+            margin-top: 30px;
+            padding: 20px;
+            box-shadow: 0 0 15px rgba(187, 134, 252, 0.2);
+        }
+        .ai-title { color: #bb86fc; font-size: 1.5rem; font-weight: bold; margin-bottom: 15px; border-bottom: 1px solid #555; padding-bottom: 10px; }
+        .ai-content { font-size: 1.1rem; line-height: 1.8; color: #fff; white-space: pre-wrap; }
+
         /* 九區塊佈局 */
         .grid-container {
             display: grid;
-            grid-template-columns: repeat(3, 1fr); /* 3欄 */
+            grid-template-columns: repeat(3, 1fr);
             gap: 15px;
             margin-top: 30px;
         }
-        @media (max-width: 900px) {
-            .grid-container { grid-template-columns: repeat(2, 1fr); }
-        }
-        @media (max-width: 600px) {
-            .grid-container { grid-template-columns: 1fr; }
-        }
+        @media (max-width: 900px) { .grid-container { grid-template-columns: repeat(2, 1fr); } }
+        @media (max-width: 600px) { .grid-container { grid-template-columns: 1fr; } }
 
-        .block-card {
-            background: #252526;
-            border: 1px solid #444;
-            border-radius: 8px;
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
-        }
-        /* 讓流日運勢 (區塊9) 跨兩欄顯示 (如果寬度夠) */
-        .block-9 {
-            grid-column: span 1; /* 預設不跨 */
-        }
-        @media (min-width: 900px) {
-            .block-9 { grid-column: span 1; } /* 可自行調整為 span 3 讓它在最下面全寬 */
-        }
+        .block-card { background: #252526; border: 1px solid #444; border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
+        .block-9 { grid-column: span 1; }
+        @media (min-width: 900px) { .block-9 { grid-column: span 1; } }
 
-        .block-header {
-            background: #003366;
-            color: #fff;
-            padding: 10px 15px;
-            font-weight: bold;
-            font-size: 1.1rem;
-            border-bottom: 1px solid #444;
-        }
-        .block-content {
-            padding: 15px;
-            font-family: "Microsoft JhengHei", sans-serif;
-            font-size: 0.95rem;
-            line-height: 1.6;
-            color: #ddd;
-            overflow-y: auto;
-            max-height: 400px;
-        }
+        .block-header { background: #003366; color: #fff; padding: 10px 15px; font-weight: bold; font-size: 1.1rem; border-bottom: 1px solid #444; }
+        .block-content { padding: 15px; font-family: "Microsoft JhengHei", sans-serif; font-size: 0.95rem; line-height: 1.6; color: #ddd; overflow-y: auto; max-height: 400px; }
 
-        /* 顏色標籤 CSS (對應 zh2.py 的 logic) */
         .lu { color: #27ae60; font-weight: bold; }
         .quan { color: #9b59b6; font-weight: bold; }
         .ke { color: #2980b9; font-weight: bold; }
@@ -253,34 +267,26 @@ HTML_TEMPLATE = """
         .luck-good { color: #d35400; font-weight: bold; }
         .luck-bad { color: #7f8c8d; font-weight: bold; }
         
-        .raw-data-area {
-            margin-top: 30px;
-            border-top: 1px solid #444;
-            padding-top: 20px;
-        }
-        .raw-data-area textarea {
-            width: 100%; height: 150px;
-            background: #111; color: #0f0; border: 1px solid #444;
-            font-family: monospace;
-        }
+        .raw-data-area { margin-top: 30px; border-top: 1px solid #444; padding-top: 20px; }
+        .raw-data-area textarea { width: 100%; height: 150px; background: #111; color: #0f0; border: 1px solid #444; font-family: monospace; }
     </style>
     <script>
         function showLoading() {
             document.getElementById('loading').style.display = 'block';
             document.getElementById('submitBtn').disabled = true;
-            document.getElementById('submitBtn').innerText = '分析運算中...';
+            document.getElementById('submitBtn').innerText = '正在召喚 AI 大師解盤...';
         }
     </script>
 </head>
 <body>
     <div id="loading" class="loading-overlay">
         <div class="loading-text">🔮 命盤解析中...</div>
-        <p style="color:#fff;">爬蟲取盤 -> 核心運算 -> 九宮格重組</p>
+        <p style="color:#fff;">爬蟲取盤 -> 核心運算 -> Gemini AI 解讀</p>
     </div>
 
     <div class="container">
         <h1>🌌 紫微斗數智慧分析 (Web整合版)</h1>
-        <div class="subtitle">爬蟲 + 核心運算 + 自動九區塊分類</div>
+        <div class="subtitle">爬蟲 + 核心運算 + AI 大師解讀</div>
         
         <form method="post" onsubmit="showLoading()">
             <div class="control-panel">
@@ -333,6 +339,13 @@ HTML_TEMPLATE = """
             <div class="error-msg">⚠️ 執行錯誤：<br>{{ error }}</div>
         {% endif %}
 
+        {% if ai_analysis %}
+        <div class="ai-result-box">
+            <div class="ai-title">🤖 Gemini 大師解讀</div>
+            <div class="ai-content">{{ ai_analysis | safe }}</div>
+        </div>
+        {% endif %}
+
         {% if blocks %}
         <div class="grid-container">
             {% for bid in range(1, 10) %}
@@ -357,8 +370,6 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# ================= 路由控制 (Controller) =================
-
 @app.route("/", methods=["GET", "POST"])
 def index():
     default_target_year = engine.current_year() + 1
@@ -367,7 +378,7 @@ def index():
         "year": "1992", "month": "9", "day": "25", "hour": "7", 
         "sex": "0", 
         "target_year": default_target_year, 
-        "blocks": None, "error": "", "raw_data": ""
+        "blocks": None, "error": "", "raw_data": "", "ai_analysis": ""
     }
 
     if request.method == "POST":
@@ -398,9 +409,25 @@ def index():
                     final_res_text = engine.run_chart_from_text(raw_data, target_year=target_year)
                     
                     # 3. 呼叫 zh2_logic 進行九區塊重組
-                    # 這裡就是你要的整合點：將 core 的文字輸出轉給 logic 處理
                     blocks_data = logic_adapter.process_ziwei_data(final_res_text)
                     context["blocks"] = blocks_data
+
+                    # 4. Gemini AI 解讀 (當 API Key 存在時)
+                    if GEMINI_API_KEY:
+                        try:
+                            # 組合 Prompt 內容
+                            full_content = "【使用者命盤數據】\n"
+                            for bid in range(1, 10):
+                                clean = re.sub(r'<[^>]+>', '', blocks_data[bid]['content'])
+                                full_content += f"### {blocks_data[bid]['title']}\n{clean}\n\n"
+
+                            model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_PROMPT)
+                            response = model.generate_content(full_content)
+                            context["ai_analysis"] = response.text
+                            
+                        except Exception as ai_e:
+                            print(f"AI Error: {ai_e}")
+                            context["ai_analysis"] = f"AI 大師休息中 (錯誤: {ai_e})"
                     
                 except Exception as logic_error:
                     import traceback
@@ -418,5 +445,4 @@ def open_browser():
 if __name__ == "__main__":
     print(f"=== 紫微斗數 Web UI 啟動 (連結核心版本: {getattr(engine, 'CYEAR', 'Unknown')}) ===")
     Timer(1, open_browser).start()
-
     app.run(host="0.0.0.0", port=5000, debug=False)
