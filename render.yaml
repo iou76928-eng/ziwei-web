@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ziwei-service
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app_ui:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.0
+      - key: CHROME_BIN  # 告訴 Selenium Chrome 在哪
+        value: /usr/bin/google-chrome
+    # 這裡很重要，使用 Render 提供的 Chrome 安裝包
+    buildPacks:
+      - key: python
+      - key: https://github.com/render-examples/chrome-headless-buildpack.git
