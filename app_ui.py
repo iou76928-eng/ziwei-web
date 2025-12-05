@@ -21,62 +21,54 @@ app = Flask(__name__)
 # ================= 爬蟲層 (Data Layer) - 改用 Requests 輕量化版 =================
 def scrape_and_format_raw_text(year, month, day, hour, gender_val):
     """
-    使用 Requests 取代 Selenium，大幅降低記憶體消耗。
+    修正版：使用 Requests + Regex 文字特徵識別，解決 HTML 標籤解析失敗的問題。
     """
+    import requests
+    from bs4 import BeautifulSoup
+    import re
+    
+    driver = None
     try:
-        print(f"【爬蟲啟動 (Light)】目標：{year}/{month}/{day} {hour}時 (性別:{gender_val})")
+        print(f"【爬蟲啟動 (Robust)】目標：{year}/{month}/{day} {hour}時 (性別:{gender_val})")
         
-        # 目標網址
         url = "https://fate.windada.com/cgi-bin/fate"
-        
-        # 參數處理：Windada (與多數傳統CGI) 通常定義 1=男, 2=女
-        # 你的 UI 傳入 1(男) 或 0(女)，這邊做個轉換以防萬一
+        # 轉換性別參數：UI傳入 1(男)/0(女) -> 網站需要 1(男)/2(女)
         sex_payload = "1" if str(gender_val) == "1" else "2"
         
-        # 建構 POST 資料 (模擬表單提交)
-        # 根據經驗與網頁結構，input name 通常為 year, month, day, hour, sex
         payload = {
             "year": year,
             "month": month,
             "day": day,
             "hour": hour,
             "sex": sex_payload,
-            "method": "0"  # 有些 CGI 需要預設方法參數，通常 0 是排盤
+            "method": "0" 
         }
         
-        # 偽裝成瀏覽器 User-Agent
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Referer": "https://fate.windada.com/"
         }
 
-        # 發送請求
-        response = requests.post(url, data=payload, headers=headers, timeout=10)
+        # 1. 發送請求
+        response = requests.post(url, data=payload, headers=headers, timeout=15)
         
-        # 編碼處理：台灣舊網站通常是 Big5 或 CP950
-        response.encoding = "cp950" 
+        # 2. 強制設定編碼 (關鍵修復：嘗試 cp950，若失敗則用自動偵測)
+        response.encoding = "cp950"
         
-        if response.status_code != 200:
-            return f"遠端伺服器回應錯誤: {response.status_code}"
+        # 如果發現內容是亂碼 (不包含 '紫微' 或 '命盤')，嘗試切換編碼
+        if "紫微" not in response.text and "命" not in response.text:
+            response.encoding = response.apparent_encoding
 
         page_html = response.text
-        
-        # 檢查是否成功抓到內容
-        if "紫微" not in page_html and "命宮" not in page_html:
-             # 如果 POST 失敗，嘗試 GET (有些舊站容錯)
-            print("POST 失敗，嘗試 GET...")
-            response = requests.get(url, params=payload, headers=headers, timeout=10)
-            response.encoding = "cp950"
-            page_html = response.text
 
     except Exception as e:
-        return f"連線錯誤 (Requests): {str(e)}"
+        return f"連線錯誤: {str(e)}"
 
-    # === 以下解析邏輯 (BeautifulSoup) 保持不變 ===
+    # === 解析邏輯 (大幅放寬標準) ===
     soup = BeautifulSoup(page_html, 'html.parser')
     
     header_lines = []
-    # 嘗試抓取中間的命主資訊
+    # 嘗試抓取中間資訊
     center_cell = soup.find("td", {"colspan": "2"})
     if center_cell:
         full_text = center_cell.get_text(separator="\n")
@@ -86,25 +78,36 @@ def scrape_and_format_raw_text(year, month, day, hour, gender_val):
                 header_lines.append(line)
     
     cells = []
+    # 定義宮位關鍵字
     palace_keywords = ["命宮", "兄弟", "夫妻", "子女", "財帛", "疾厄", 
                        "遷移", "交友", "事業", "田宅", "福德", "父母"]
+    
     all_tds = soup.find_all('td')
     
     for td in all_tds:
+        # 略過中間的大格子
         if td.get("colspan") == "2": continue
-        b_tag = td.find("b")
-        if not b_tag: continue
-        palace_raw = b_tag.get_text(strip=True)
-        palace_clean = palace_raw.replace("【", "").replace("】", "").replace("[", "").replace("]", "")
         
+        # 取得該格子的純文字
+        full_text = td.get_text(separator=" ", strip=True)
+        
+        # === 修正點：使用 Regex 直接抓取 【XX宮】，不依賴 <b> 標籤 ===
+        palace_match = re.search(r'【(.*?)】', full_text)
+        
+        if not palace_match:
+            continue # 沒抓到括號，跳過
+            
+        palace_clean = palace_match.group(1).replace("[", "").replace("]", "")
+        
+        # 再次確認括號內的文字是否為有效宮位
         is_valid_palace = False
         for pk in palace_keywords:
             if pk in palace_clean:
                 is_valid_palace = True
                 break
         if not is_valid_palace: continue
-            
-        full_text = td.get_text(separator=" ", strip=True)
+
+        # === 以下資料清理邏輯保持不變 ===
         stem_match = re.search(r'([甲乙丙丁戊己庚辛壬癸][子丑寅卯辰巳午未申酉戌亥])', full_text)
         stem_str = stem_match.group(1) if stem_match else "??"
         
@@ -119,12 +122,15 @@ def scrape_and_format_raw_text(year, month, day, hour, gender_val):
         else:
             xiaoxian_str = "小限: (自動補全)"
 
+        # 移除已抓取的資訊，剩下的就是星曜
         star_text_raw = full_text
         star_text_raw = star_text_raw.replace(stem_str, "", 1)
-        star_text_raw = star_text_raw.replace(palace_raw, "")
-        star_text_raw = star_text_raw.replace(f"【{palace_clean}】", "")
+        # 移除 【XX宮】 整個字串
+        star_text_raw = star_text_raw.replace(palace_match.group(0), "") 
+        
         if daxian_match: star_text_raw = star_text_raw.replace(daxian_match.group(0), "")
         if xiaoxian_match: star_text_raw = star_text_raw.replace(xiaoxian_match.group(0), "")
+        
         star_text_raw = re.sub(r'大限\s*[:：]?', '', star_text_raw)
         star_text_raw = re.sub(r'小限\s*[:：]?', '', star_text_raw)
         star_text_clean = re.sub(r'\s+', ',', star_text_raw.strip())
@@ -139,7 +145,9 @@ def scrape_and_format_raw_text(year, month, day, hour, gender_val):
         cells.append(formatted_cell)
 
     if len(cells) < 12:
-        return f"錯誤：無法解析宮位 (只抓到 {len(cells)} 個)，可能網站參數改變或編碼錯誤。\n解析Log: {cells}"
+        # 如果還是失敗，把 HTML 存下來或印出片段方便除錯
+        preview = page_html[:500] if page_html else "Empty HTML"
+        return f"錯誤：無法解析宮位 (只抓到 {len(cells)} 個)。\nHTML預覽: {preview}..."
 
     final_raw_text = "\n".join(header_lines) + "\n\n" + "\n\n".join(cells)
     return final_raw_text
@@ -397,3 +405,4 @@ if __name__ == "__main__":
     # 在 Render 上不需要自動開啟瀏覽器，可以註解掉，或保留給本地測試用
     # Timer(1, open_browser).start()
     app.run(host="0.0.0.0", port=5000, debug=False)
+
